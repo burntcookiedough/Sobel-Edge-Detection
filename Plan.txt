@@ -1,0 +1,436 @@
+## 1. Environment Setup
+
+### A. Hardware & Software Requirements
+- **Hardware:**  
+  - A CUDA-capable GPU (Compute Capability ≥ 6.0; e.g., NVIDIA RTX series).
+  - A multi-core CPU.
+  - At least 4 GB of GPU memory.
+- **Software:**  
+  - **Operating System:** Linux (Ubuntu 20.04+ recommended) or Windows (instructions will be similar).
+  - **CUDA Toolkit:** Version 11 or later.
+  - **OpenCV:** Version 4.x.
+  - **Compiler:** NVIDIA’s nvcc and a C++ compiler (e.g., g++ on Linux).
+  - **Development Tools:** CMake for build configuration (optional but recommended), NVIDIA Nsight for profiling.
+
+### B. Installation Steps
+1. **Install CUDA Toolkit:**
+   - On Ubuntu, run:
+     
+bash
+     sudo apt-get update
+     sudo apt-get install nvidia-cuda-toolkit
+
+   - Verify with:
+     
+bash
+     nvcc --version
+
+2. **Install OpenCV:**
+   - Using your package manager or build from source. For Ubuntu:
+     
+bash
+     sudo apt-get install libopencv-dev python3-opencv
+
+   - Confirm installation by running a simple OpenCV Python script (optional).
+
+3. **Setup a Project Directory:**  
+   Create a new directory, e.g., sobel_edge_cuda, and structure it as follows:
+   
+sobel_edge_cuda/
+   ├── src/
+   │    ├── main.cpp
+   │    └── sobel_kernel.cu
+   ├── CMakeLists.txt   (if using CMake)
+   └── README.md
+
+
+---
+
+## 2. Project Design & Data Flow Overview
+
+### A. High-Level Data Flow
+1. **Video Capture:**  
+   - Use OpenCV in the host (CPU) to capture video frames.
+2. **Pre-Processing:**  
+   - Convert each frame to grayscale.
+   - Transfer grayscale data from host (CPU) to device (GPU).
+3. **GPU Processing (Sobel Kernel):**  
+   - Each GPU thread computes one pixel’s gradient using Sobel convolution.
+   - Use **tiling with shared memory** to minimize global memory accesses.
+4. **Post-Processing:**  
+   - Transfer the resulting edge map back to the host.
+   - Display the processed frame in real time.
+
+### B. Memory Hierarchy & Data Layout
+- **Global Memory (GPU):**  
+  - Holds the entire image (flattened as 1D array) for input and output.
+- **Shared Memory (GPU):**  
+  - Holds a tile (block) of the image plus a halo (border) region needed for convolution.
+- **Registers:**  
+  - Used in each thread for temporary variables (Gx, Gy, pixel intensity).
+
+---
+
+## 3. Detailed Kernel Implementation
+
+### A. Kernel Strategy and Tiling
+- **Tiling:**  
+  - Divide the image into blocks of TILE_SIZE × TILE_SIZE (e.g., 16×16).
+  - Each block loads its region from global memory into a shared memory array sized (TILE_SIZE + 2) × (TILE_SIZE + 2). This extra border (halo) gives access to neighbor pixels required for a 3×3 kernel.
+- **Thread Mapping:**  
+  - Each thread corresponds to one pixel within the tile (not the halo).
+- **Synchronization:**  
+  - Use __syncthreads() after loading the tile to ensure all threads have the necessary data.
+
+### B. Sobel Convolution Detailed
+- **Sobel Kernels:**
+  - **Gx Kernel:**
+    
+-1   0   1  
+    -2   0   2  
+    -1   0   1
+
+  - **Gy Kernel:**
+    
+1   2   1  
+     0   0   0  
+    -1  -2  -1
+
+- **Per-Pixel Calculation:**
+  - For each thread (representing pixel at position [i,j] in shared memory, offset by +1 due to halo), compute:
+    
+cpp
+    int Gx = -tile[ty-1][tx-1] + tile[ty-1][tx+1]
+             - 2 * tile[ty][tx-1] + 2 * tile[ty][tx+1]
+             - tile[ty+1][tx-1] + tile[ty+1][tx+1];
+
+    int Gy =  tile[ty-1][tx-1] + 2 * tile[ty-1][tx] + tile[ty-1][tx+1]
+             - tile[ty+1][tx-1] - 2 * tile[ty+1][tx] - tile[ty+1][tx+1];
+
+  - Compute the gradient magnitude:
+    
+cpp
+    int gradient = abs(Gx) + abs(Gy);  // Approximation (faster than sqrt)
+    gradient = gradient > 255 ? 255 : gradient;
+
+  - Write the result to the output array.
+
+### C. Complete Kernel Code Explanation (sobel_kernel.cu)
+Below is an annotated version of the CUDA kernel:
+
+cpp
+// Define block dimensions
+#define TILE_SIZE 16
+// Shared memory tile size includes halo: extra 1 pixel border on each side
+#define SMEM_SIZE (TILE_SIZE + 2)
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+// Kernel for Sobel edge detection using shared memory tiling
+__global__ void sobel_filter(const unsigned char* input, unsigned char* output,
+                             int width, int height) {
+
+    // Calculate global indices for the pixel this thread corresponds to
+    int x = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int y = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    // Allocate shared memory for the tile + halo region
+    __shared__ unsigned char smem[SMEM_SIZE][SMEM_SIZE];
+
+    // Calculate indices within shared memory (offset by 1 for halo)
+    int smem_x = threadIdx.x + 1;
+    int smem_y = threadIdx.y + 1;
+
+    // Load the central pixel (if within image bounds)
+    if (x < width && y < height) {
+        smem[smem_y][smem_x] = input[y * width + x];
+    } else {
+        // Set padding value for out-of-bound indices
+        smem[smem_y][smem_x] = 0;
+    }
+
+    // Load halo data along the borders:
+    // 1. Left and Right halo
+    if (threadIdx.x == 0) {
+        // Left halo pixel for current row in shared memory
+        int x_left = x - 1;
+        smem[smem_y][0] = (x_left >= 0 && y < height) ? input[y * width + x_left] : 0;
+    }
+    if (threadIdx.x == TILE_SIZE - 1) {
+        // Right halo pixel
+        int x_right = x + 1;
+        smem[smem_y][SMEM_SIZE - 1] = (x_right < width && y < height) ? input[y * width + x_right] : 0;
+    }
+    // 2. Top and Bottom halo
+    if (threadIdx.y == 0) {
+        int y_top = y - 1;
+        smem[0][smem_x] = (y_top >= 0 && x < width) ? input[y_top * width + x] : 0;
+    }
+    if (threadIdx.y == TILE_SIZE - 1) {
+        int y_bottom = y + 1;
+        smem[SMEM_SIZE - 1][smem_x] = (y_bottom < height && x < width) ? input[y_bottom * width + x] : 0;
+    }
+    // 3. Corners (each thread at corner loads its respective halo if needed)
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        // Top-left corner
+        int x_left = x - 1, y_top = y - 1;
+        smem[0][0] = (x_left >= 0 && y_top >= 0) ? input[(y_top) * width + x_left] : 0;
+    }
+    if (threadIdx.x == TILE_SIZE - 1 && threadIdx.y == 0) {
+        // Top-right corner
+        int x_right = x + 1, y_top = y - 1;
+        smem[0][SMEM_SIZE - 1] = (x_right < width && y_top >= 0) ? input[(y_top) * width + x_right] : 0;
+    }
+    if (threadIdx.x == 0 && threadIdx.y == TILE_SIZE - 1) {
+        // Bottom-left corner
+        int x_left = x - 1, y_bottom = y + 1;
+        smem[SMEM_SIZE - 1][0] = (x_left >= 0 && y_bottom < height) ? input[y_bottom * width + x_left] : 0;
+    }
+    if (threadIdx.x == TILE_SIZE - 1 && threadIdx.y == TILE_SIZE - 1) {
+        // Bottom-right corner
+        int x_right = x + 1, y_bottom = y + 1;
+        smem[SMEM_SIZE - 1][SMEM_SIZE - 1] = (x_right < width && y_bottom < height) ? input[y_bottom * width + x_right] : 0;
+    }
+
+    // Ensure all threads have loaded their pixel(s)
+    __syncthreads();
+
+    // Only process valid pixels (avoid boundary issues)
+    if (x > 0 && y > 0 && x < (width - 1) && y < (height - 1)) {
+        // Use shared memory for 3x3 convolution
+        int Gx = -smem[smem_y - 1][smem_x - 1] + smem[smem_y - 1][smem_x + 1]
+                 - 2 * smem[smem_y][smem_x - 1] + 2 * smem[smem_y][smem_x + 1]
+                 - smem[smem_y + 1][smem_x - 1] + smem[smem_y + 1][smem_x + 1];
+
+        int Gy = smem[smem_y - 1][smem_x - 1] + 2 * smem[smem_y - 1][smem_x] + smem[smem_y - 1][smem_x + 1]
+                 - smem[smem_y + 1][smem_x - 1] - 2 * smem[smem_y + 1][smem_x] - smem[smem_y + 1][smem_x + 1];
+
+        int gradient = abs(Gx) + abs(Gy);
+        if (gradient > 255) gradient = 255;  // Clamp value
+
+        // Write the result to global memory
+        output[y * width + x] = (unsigned char)gradient;
+    }
+    // Threads outside valid region do not write output.
+}
+
+
+**Line-by-line details:**
+- **Lines defining TILE_SIZE and SMEM_SIZE:**  
+  Set block dimensions; SMEM_SIZE accounts for the 1-pixel border.
+- **Global Indices Calculation:**  
+  Determines each thread’s pixel coordinate in the input image.
+- **Shared Memory Loading:**  
+  Each thread loads its corresponding pixel and, if it’s on a boundary within the block, also loads necessary halo elements.
+- **Synchronization (__syncthreads()):**  
+  Guarantees that all tile data is ready before any thread begins convolution.
+- **Boundary Check:**  
+  The kernel only processes pixels not on the overall image border (ensuring that each pixel has a full 3×3 neighborhood).
+- **Convolution Computation:**  
+  Uses the Sobel masks on the shared memory tile to compute Gx and Gy.
+- **Result Clamping and Writing:**  
+  The computed gradient is clamped (max 255) and then written back to global memory.
+
+---
+
+## 4. Host Code Integration (main.cpp)
+
+This is the host application that uses OpenCV for video capture, sends data to the GPU, launches the CUDA kernel, and then displays the result.
+
+### Detailed Host Code with Comments
+
+cpp
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <cuda_runtime.h>
+
+// Forward declaration of the CUDA kernel
+__global__ void sobel_filter(const unsigned char* input, unsigned char* output, int width, int height);
+
+// Error-checking macro for CUDA API calls
+#define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+    if (code != cudaSuccess)
+    {
+        std::cerr << "CUDA Error: " << cudaGetErrorString(code) << " " << file << ":" << line << std::endl;
+        if (abort) exit(code);
+    }
+}
+
+int main() {
+    // Initialize video capture from the default camera
+    cv::VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        std::cerr << "Error: Unable to open the camera stream." << std::endl;
+        return -1;
+    }
+
+    // Set desired frame resolution (optional)
+    int frame_width = 640, frame_height = 480;
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, frame_width);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, frame_height);
+
+    cv::Mat frame, gray;
+    
+    // Device pointers for input and output images
+    unsigned char *d_input, *d_output;
+    size_t numPixels = frame_width * frame_height * sizeof(unsigned char);
+
+    // Allocate GPU memory for both input and output image buffers
+    cudaCheckError( cudaMalloc((void**)&d_input, numPixels) );
+    cudaCheckError( cudaMalloc((void**)&d_output, numPixels) );
+
+    // Define tile (block) dimensions; must match the kernel's TILE_SIZE (e.g., 16)
+    const int TILE_SIZE = 16;
+    dim3 blockSize(TILE_SIZE, TILE_SIZE);
+    dim3 gridSize((frame_width + TILE_SIZE - 1) / TILE_SIZE,
+                  (frame_height + TILE_SIZE - 1) / TILE_SIZE);
+
+    while (true) {
+        cap >> frame;  // Capture a frame
+        if (frame.empty()) break;
+
+        // Convert to grayscale; necessary for Sobel
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        // Copy grayscale frame from host to device
+        cudaCheckError( cudaMemcpy(d_input, gray.data, numPixels, cudaMemcpyHostToDevice) );
+
+        // Launch the Sobel edge detection kernel
+        sobel_filter<<<gridSize, blockSize>>>(d_input, d_output, frame_width, frame_height);
+        cudaCheckError( cudaDeviceSynchronize() );
+
+        // Copy the computed edge map back to the host
+        cv::Mat edgeImage(frame_height, frame_width, CV_8UC1);
+        cudaCheckError( cudaMemcpy(edgeImage.data, d_output, numPixels, cudaMemcpyDeviceToHost) );
+
+        // Display the original and edge-detected images side by side
+        cv::imshow("Original", gray);
+        cv::imshow("Sobel Edges", edgeImage);
+
+        // Break the loop if the user presses the ESC key (ASCII 27)
+        if (cv::waitKey(1) == 27) break;
+    }
+
+    // Clean up: Free device memory and release the camera
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cap.release();
+    cv::destroyAllWindows();
+
+    return 0;
+}
+
+
+**Key points in Host Code:**
+- **Error Checking:**  
+  The macro cudaCheckError() ensures any CUDA error is caught immediately.
+- **Video Capture & Grayscale Conversion:**  
+  Uses OpenCV to grab frames and convert them to a one-channel (grayscale) image.
+- **Memory Management:**  
+  Allocates device memory only once outside the loop, and reuses it for each frame to minimize overhead.
+- **Kernel Launch:**  
+  Grid and block sizes are computed based on image resolution, matching the kernel’s expectations.
+- **Display:**  
+  Uses OpenCV’s imshow() to show real-time output.
+
+---
+
+## 5. Building and Running the Project
+
+### A. Using CMake (Recommended)
+Create a CMakeLists.txt in your project root:
+
+cmake
+cmake_minimum_required(VERSION 3.10)
+project(SobelEdgeCUDA)
+
+find_package(OpenCV REQUIRED)
+
+# Enable CUDA
+find_package(CUDA REQUIRED)
+set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -arch=sm_60")
+
+# Specify the source files
+set(SOURCES src/main.cpp src/sobel_kernel.cu)
+
+cuda_add_executable(${PROJECT_NAME} ${SOURCES})
+target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
+
+
+Then run:
+bash
+mkdir build && cd build
+cmake ..
+make
+./SobelEdgeCUDA
+
+
+### B. Manual Compilation (Command Line)
+If you prefer compiling manually, use:
+bash
+nvcc -arch=sm_60 -I/path/to/opencv/include -L/path/to/opencv/lib \
+    src/main.cpp src/sobel_kernel.cu -lopencv_core -lopencv_highgui -lopencv_imgproc -o SobelEdgeCUDA
+
+*(Replace /path/to/opencv/include and /path/to/opencv/lib with your actual paths.)*
+
+---
+
+## 6. Debugging & Profiling
+
+### A. Debugging
+- **CUDA-MEMCHECK:**  
+  Run your executable with:
+  
+bash
+  cuda-memcheck ./SobelEdgeCUDA
+
+  This checks for memory access errors.
+- **Print Statements:**  
+  You can temporarily insert device-side printf calls (remember to compile with debugging flags) to inspect variables.
+
+### B. Profiling
+- **NVIDIA Nsight Systems/Compute:**  
+  - Launch your executable through Nsight to profile GPU occupancy, memory throughput, and execution timings.
+  - Look for:
+    - **Occupancy metrics:** Ensure your block size and shared memory usage are optimal.
+    - **Memory Access:** Check for coalesced memory accesses and high utilization of shared memory.
+- **Kernel Timing:**  
+  Add CUDA events in the host code to measure kernel execution time. For example:
+  
+cpp
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventRecord(start, 0);
+
+  sobel_filter<<<gridSize, blockSize>>>(d_input, d_output, frame_width, frame_height);
+  
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  float elapsedTime;
+  cudaEventElapsedTime(&elapsedTime, start, stop);
+  std::cout << "Kernel Execution Time: " << elapsedTime << " ms" << std::endl;
+  
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
+
+---
+
+## 7. Future Enhancements and Fine-Tuning
+
+- **Adaptive Tiling:**  
+  Experiment with different tile sizes (e.g., 32×32) and adjust shared memory allocations accordingly.
+- **Edge Thresholding:**  
+  Implement thresholding on the GPU to refine the output edge map.
+- **Multi-streaming:**  
+  Overlap data transfers (using CUDA streams) with kernel execution to further reduce latency.
+- **FPGA Prototype:**  
+  Once the GPU version is tuned, consider porting the design ideas to an FPGA for ultra-low latency applications.
+
+---
+
+This comprehensive guide gives you every step from setting up your environment, writing detailed kernel and host code, compiling, and debugging the project—leaving no stone unturned. Once implemented, you’ll have a robust real-time Sobel edge detection system leveraging GPU acceleration and optimized data handling, ready to scale up for high-performance image filtering applications.
